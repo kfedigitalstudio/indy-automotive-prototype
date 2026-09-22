@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   prepare:
-    if: github.event.head_commit.message == 'Prepare safe web logo crops'
+    if: github.event.head_commit.message == 'Correct web logo crops'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -19,7 +19,7 @@ jobs:
       - name: Install Pillow
         run: python -m pip install --quiet pillow
 
-      - name: Crop excess whitespace and update header sizing
+      - name: Rebuild tightly cropped web logo assets
         shell: bash
         run: |
           python - <<'PY'
@@ -35,76 +35,66 @@ jobs:
           for src_name, out_name in logos.items():
               src = Path(src_name)
               out = Path(out_name)
-              img = Image.open(src).convert('RGBA')
+              original = Image.open(src).convert('RGBA')
+              rgb = original.convert('RGB')
 
-              # Detect the actual artwork against either transparent or near-white canvas.
-              rgb = img.convert('RGB')
               white = Image.new('RGB', rgb.size, (255, 255, 255))
-              diff = ImageChops.difference(rgb, white).convert('L')
-              # Ignore tiny JPEG/PNG compression variations in the white background.
-              mask = diff.point(lambda p: 255 if p > 18 else 0)
+              diff = ImageChops.difference(rgb, white)
+              dr, dg, db = diff.split()
+              color_mask = ImageChops.lighter(ImageChops.lighter(dr, dg), db)
+              color_mask = color_mask.point(lambda p: 255 if p > 14 else 0)
 
-              # If transparency is meaningful, include visible non-transparent pixels too.
-              alpha = img.getchannel('A')
-              alpha_mask = alpha.point(lambda p: 255 if p > 20 else 0)
-              mask = ImageChops.lighter(mask, alpha_mask)
+              alpha = original.getchannel('A')
+              alpha_min, alpha_max = alpha.getextrema()
+              if alpha_min < 250:
+                  alpha_mask = alpha.point(lambda p: 255 if p > 20 else 0)
+                  mask = ImageChops.lighter(color_mask, alpha_mask)
+              else:
+                  # Fully opaque PNG: ignore alpha or it would mark the white canvas as artwork.
+                  mask = color_mask
 
               bbox = mask.getbbox()
-              if bbox:
-                  l, t, r, b = bbox
-                  pad_x = max(18, int((r - l) * 0.05))
-                  pad_y = max(14, int((b - t) * 0.07))
-                  l = max(0, l - pad_x)
-                  t = max(0, t - pad_y)
-                  r = min(img.width, r + pad_x)
-                  b = min(img.height, b + pad_y)
-                  img = img.crop((l, t, r, b))
+              if not bbox:
+                  raise RuntimeError(f'Could not detect logo artwork in {src_name}')
 
-              # Keep browser assets reasonably sized while preserving quality.
+              l, t, r, b = bbox
+              art_w, art_h = r - l, b - t
+              pad_x = max(14, round(art_w * 0.045))
+              pad_y = max(12, round(art_h * 0.06))
+              crop_box = (
+                  max(0, l - pad_x),
+                  max(0, t - pad_y),
+                  min(original.width, r + pad_x),
+                  min(original.height, b + pad_y),
+              )
+              img = original.crop(crop_box)
+
               max_w = 900
               if img.width > max_w:
                   ratio = max_w / img.width
                   img = img.resize((max_w, max(1, round(img.height * ratio))), Image.Resampling.LANCZOS)
 
               img.save(out, 'PNG', optimize=True)
-              print(f'{src_name}: {Image.open(src).size} -> {out_name}: {img.size}')
+              print(f'{src_name}: original={original.size}, artwork_bbox={bbox}, crop={crop_box}, web={img.size}')
 
-          pages = [
-              Path('dealer/index.html'),
-              Path('repairs/index.html'),
-              Path('repairs/brakes/index.html'),
-              Path('rental/index.html'),
-          ]
-
-          old_desktop = '.brand-logo{display:flex;align-items:center;justify-content:flex-start;min-width:300px;width:300px;height:90px;overflow:hidden}.brand-logo img{display:block;width:300px;height:90px;object-fit:contain;object-position:center;transform:scale(1.8);transform-origin:center}'
-          new_desktop = '.brand-logo{display:flex;align-items:center;justify-content:flex-start;min-width:220px;height:94px;overflow:visible}.brand-logo img{display:block;width:auto;height:auto;max-width:230px;max-height:86px;object-fit:contain;object-position:left center;transform:none}'
-          old_mobile = '.brand-logo{min-width:0;width:220px;height:64px}.brand-logo img{width:220px;height:64px;object-fit:contain;object-position:center;transform:scale(1.75);transform-origin:center}'
-          new_mobile = '.brand-logo{min-width:0;width:auto;height:70px}.brand-logo img{width:auto;height:auto;max-width:185px;max-height:64px;object-fit:contain;object-position:left center;transform:none}'
-
-          replacements = {
-              'indy-auto-group-logo.png': 'indy-auto-group-logo-web.png',
-              'indy-auto-repairs-logo.png': 'indy-auto-repairs-logo-web.png',
-              'alta-rental-logo.png': 'alta-rental-logo-web.png',
-          }
-
-          for p in pages:
-              s = p.read_text(encoding='utf-8')
-              for old, new in replacements.items():
-                  s = s.replace(old, new)
-              if old_desktop not in s:
-                  raise RuntimeError(f'Current desktop logo CSS not found in {p}')
-              s = s.replace(old_desktop, new_desktop, 1)
-              if old_mobile not in s:
-                  raise RuntimeError(f'Current mobile logo CSS not found in {p}')
-              s = s.replace(old_mobile, new_mobile, 1)
-              p.write_text(s, encoding='utf-8')
+          # Safety check: all pages must already point at the web copies and use no transforms.
+          for page in ['dealer/index.html','repairs/index.html','repairs/brakes/index.html','rental/index.html']:
+              text = Path(page).read_text(encoding='utf-8')
+              if '-logo-web.png' not in text:
+                  raise RuntimeError(f'{page} is not using the web logo asset')
+              if 'transform:scale(' in text:
+                  raise RuntimeError(f'{page} still contains logo scaling transform')
           PY
 
-      - name: Commit safe web logo assets
+      - name: Commit corrected web crops
         shell: bash
         run: |
+          if git diff --quiet; then
+            echo "No logo crop changes needed"
+            exit 0
+          fi
           git config user.name "KFE Digital Studio"
           git config user.email "actions@users.noreply.github.com"
-          git add assets/*-logo-web.png dealer/index.html repairs/index.html repairs/brakes/index.html rental/index.html
-          git commit -m "Use cropped web logos with safe header sizing [skip ci]"
+          git add assets/*-logo-web.png
+          git commit -m "Correct web logo crop bounds [skip ci]"
           git push
